@@ -1,0 +1,23 @@
+# --- Core Deep Learning & NLP ---
+torch>=2.0.0
+transformers>=4.38.0
+accelerate>=0.27.0
+sentence-transformers  # Semantic Similarity (SBERT)
+
+# --- Data Handling & Datasets ---
+datasets               # To load Big-Vul/D2A from HuggingFace
+pandas                 # For experimental results management
+numpy
+scikit-learn           # For statistical analysis and variance metrics
+
+# --- LLM Utilities ---
+bitsandbytes           # For 4-bit/8-bit quantization (if running 7B models locally)
+huggingface_hub        # For model downloading and authentication
+
+# --- Visualization & Reporting ---
+matplotlib
+seaborn                # For creating the stability heatmaps
+tqdm                   # For progress bars during long inference runs
+
+# --- Optional but Recommended ---
+python-dotenv          # To manage HuggingFace API tokens securely
