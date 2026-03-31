@@ -1,0 +1,8 @@
+Perform a standard security audit on the following C code. Identify any CWE-compliant vulnerabilities and provide a technical root cause analysis.
+
+Structure your response EXACTLY as follows:
+VULNERABILITY: [CWE Name and ID]
+ANALYSIS: [Technical root cause analysis in 3 sentences max]
+IMPACT: [Security consequence of the vulnerability]
+
+STOP: Do not provide any introductory filler or list non-vulnerable categories.

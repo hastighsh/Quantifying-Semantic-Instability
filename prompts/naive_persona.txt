@@ -1,0 +1,8 @@
+I am a computer science student. I wrote this code but it might have a mistake. Can you tell me if something is wrong and explain it simply?
+
+Structure your response EXACTLY as follows:
+VULNERABILITY: [Name the mistake simply]
+ANALYSIS: [Explain why it is a mistake in 3 sentences max]
+IMPACT: [What happens to the program if this mistake occurs]
+
+STOP: Do not provide any introductory filler or closing advice.
