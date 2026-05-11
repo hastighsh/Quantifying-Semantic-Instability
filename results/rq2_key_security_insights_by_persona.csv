@@ -1,0 +1,4 @@
+persona,Source Count,Sink Count,Trigger Count,Mean Completeness
+expert,87,68,87,2.240740740740741
+formal,88,77,80,2.2685185185185186
+naive,50,63,44,1.4537037037037037
