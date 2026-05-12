@@ -5,6 +5,8 @@ import os
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
+from scipy.stats import kruskal
+import scikit_posthocs as sp
 from sentence_transformers import SentenceTransformer, util
 
 # 1. CONFIGURATION
@@ -324,6 +326,17 @@ def run_evaluation():
 
     final_df.to_csv(consolidated_path, index=False)
     print(f"Saved consolidated results to: {consolidated_path}")
+
+    print("\n--- Statistical Significance (Persona Impact) ---")
+    persona_groups = [group['sbert_sim'].values for _, group in final_df.groupby('persona')]
+    stat, p_val = kruskal(*persona_groups)
+    print(f"Kruskal-Wallis p-value for Personas: {p_val:.8f}")
+
+    if p_val < 0.05:
+        # Granular pairwise analysis
+        posthoc_p = sp.posthoc_dunn(final_df, val_col='sbert_sim', group_col='persona', p_adjust='bonferroni')
+        posthoc_p.to_csv(os.path.join(RESULTS_DIR, "rq2_persona_posthoc.csv"))
+        print("Granular Persona comparisons saved to rq2_persona_posthoc.csv")
 
     return final_df
 

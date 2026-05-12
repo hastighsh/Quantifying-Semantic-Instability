@@ -5,9 +5,10 @@ import os
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
+import scikit_posthocs as sp
 from sentence_transformers import SentenceTransformer, util
 from sacrebleu.metrics import BLEU
-from scipy.stats import wilcoxon
+from scipy.stats import wilcoxon, kruskal
 
 # 1. LOCAL CONFIGURATION
 PROJECT_ROOT = os.getcwd()
@@ -182,5 +183,16 @@ if __name__ == "__main__":
         print(f"Mean BLEU Score: {results['bleu_score'].mean():.2f}")
         print(f"Logic Precision (Correct CWE Identified): {results['logic_precision'].mean()*100:.2f}%")
         print("="*40)
+
+        # Granular Group-level interpretation for Deception Types
+        print("\n--- Granular Strategy Analysis (Kruskal-Wallis) ---")
+        strategy_groups = [group['deceptive_sim'].values for _, group in results.groupby('deception_type')]
+        h_stat, p_kw = kruskal(*strategy_groups)
+        print(f"Kruskal-Wallis p-value (between strategies): {p_kw:.8f}")
+
+        if p_kw < 0.05:
+            posthoc_strat = sp.posthoc_dunn(results, val_col='deceptive_sim', group_col='deception_type', p_adjust='bonferroni')
+            posthoc_strat.to_csv(os.path.join(OUTPUT_DIR, "rq3_strategy_pairwise_posthoc.csv"))
+            print("Granular Strategy significance matrix saved.")
         
         results.to_csv(os.path.join(OUTPUT_DIR, "rq3_consolidated_analysis.csv"), index=False)
