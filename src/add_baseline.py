@@ -4,8 +4,9 @@ import argparse
 import pandas as pd
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# Allow TensorFloat-32 for faster matrix multiplications on Ampere/Hopper (H100) architecture
 torch.backends.cuda.matmul.allow_tf32 = True
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,7 +15,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "data", "gold_set_raw.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "baseline_shards")
 
-MODEL_ID = "deepseek-ai/deepseek-coder-7b-instruct-v1.5"
+# Upgraded to the massive 32B SOTA Code Model
+MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 BATCH_SIZE = 1
 MAX_INPUT_TOKENS = 2560
@@ -29,20 +31,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_prompt(code):
-    return f"""[INST] You are an expert C security researcher. Analyze the following code for vulnerabilities.
-
-Structure your response as follows:
-1. Logic Flow: Briefly describe what the code does.
-2. Root Cause: Identify the exact line or logic that is vulnerable.
-3. Danger: Explain why this is dangerous.
-
-CODE:
-{code}
-
-Final Explanation: [/INST]"""
-
-
 def run_baseline_inference(shard_id, num_shards):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -54,26 +42,18 @@ def run_baseline_inference(shard_id, num_shards):
     print(f"--- Loading Model: {MODEL_ID} | shard {shard_id}/{num_shards} ---")
     print(f"--- Output: {output_path} ---")
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     tokenizer.padding_side = "left"
 
+    # Loaded in native unquantized bfloat16 precision. Fits flawlessly on 1x H100!
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        quantization_config=bnb_config,
-        device_map={"": 0}, 
-        trust_remote_code=True,
-        low_cpu_mem_usage=True,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
     )
 
     model.eval()
@@ -113,7 +93,28 @@ def run_baseline_inference(shard_id, num_shards):
 
         for _, row in batch_df.iterrows():
             code = row["code"]
-            prompts.append(build_prompt(code))
+            
+            # Formulating structure for chat template compatibility
+            user_message = f"""You are an expert C security researcher. Analyze the following code for vulnerabilities.
+
+Structure your response as follows:
+1. Logic Flow: Briefly describe what the code does.
+2. Root Cause: Identify the exact line or logic that is vulnerable.
+3. Danger: Explain why this is dangerous.
+
+CODE:
+{code}
+
+Final Explanation:"""
+
+            messages = [
+                {"role": "system", "content": "You are a helpful, precise, and objective academic security code auditing assistant."},
+                {"role": "user", "content": user_message}
+            ]
+            
+            # Dynamically compile prompt with proper chat templates
+            prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompts.append(prompt_text)
             rows.append(row)
 
         inputs = tokenizer(
@@ -133,6 +134,7 @@ def run_baseline_inference(shard_id, num_shards):
                 use_cache=True,
             )
 
+        # Slice strictly the new token generations
         generated_tokens = outputs[:, inputs["input_ids"].shape[1]:]
 
         explanations = tokenizer.batch_decode(
@@ -142,8 +144,8 @@ def run_baseline_inference(shard_id, num_shards):
         )
 
         for row, explanation in zip(rows, explanations):
-            cwe = row.get("cwe_id", row.get("cwe", "Unknown"))
-            cve = row.get("cve_id", row.get("cve", "Unknown"))
+            cwe = row.get("CWE ID", row.get("cwe_id", row.get("cwe", "Unknown")))
+            cve = row.get("CVE ID", row.get("cve_id", row.get("cve", "Unknown")))
             truth = row.get("truth_description", "N/A")
 
             results.append({
@@ -161,8 +163,8 @@ def run_baseline_inference(shard_id, num_shards):
 
         if batch_counter % SAVE_EVERY_BATCHES == 0:
             pd.DataFrame(results).to_csv(output_path, index=False)
-            print(f"Shard {shard_id}: saved checkpoint with {len(results)} samples")
 
+        # Secure memory cleaning block
         del inputs, outputs, generated_tokens
         torch.cuda.empty_cache()
         gc.collect()
