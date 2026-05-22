@@ -85,12 +85,11 @@ def run_judge(shard_id, num_shards):
     torch.cuda.empty_cache()
     gc.collect()
 
-    # Using sequential loading mapping and explicit max-allocation boundary enforcement
+    # CRITICAL FIX: Mapping explicitly to GPU 0 avoids 'accelerate' framework deadlocks completely
     model = AutoModelForCausalLM.from_pretrained(
         REPO_ID,
         quantization_config=bnb_config,
-        device_map="sequential",  # Maps layer-by-layer sequentially to protect memory margins
-        max_memory={0: "72GiB"},   # Restricts model weights to 72GB, leaving 8GB strictly for context context/tokens
+        device_map={"": 0},  
         low_cpu_mem_usage=True,
         cache_dir=CACHE_DIR,
         local_files_only=True
