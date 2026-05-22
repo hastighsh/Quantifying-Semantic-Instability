@@ -15,7 +15,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "data", "gold_set_raw.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "baseline_shards")
 
-# Upgraded to the massive 32B SOTA Code Model
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
 
 BATCH_SIZE = 1
@@ -49,37 +48,38 @@ def run_baseline_inference(shard_id, num_shards):
 
     tokenizer.padding_side = "left"
 
-    # Loaded in native unquantized bfloat16 precision. Fits flawlessly on 1x H100!
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         device_map="auto",
     )
-
     model.eval()
 
     if not os.path.exists(INPUT_PATH):
         raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
 
-    df = pd.read_csv(INPUT_PATH)
+    # Read dataset, ensuring all textual columns are loaded completely as strings
+    df = pd.read_csv(INPUT_PATH, dtype=str)
     df = df.reset_index().rename(columns={"index": "original_index"})
+    df["original_index"] = df["original_index"].astype(int)
 
-    # shard by original index
+    # Shard by original index
     df = df[df["original_index"] % num_shards == shard_id].copy()
 
     results = []
 
-    # Resume support
+    # Safe Resume support
     if os.path.exists(output_path):
-        done_df = pd.read_csv(output_path)
-        if "original_index" in done_df.columns:
-            done_indices = set(done_df["original_index"].tolist())
-            results = done_df.to_dict("records")
-            df = df[~df["original_index"].isin(done_indices)]
-            print(
-                f"--- Resuming shard {shard_id}: "
-                f"{len(done_indices)} done, {len(df)} remaining ---"
-            )
+        try:
+            done_df = pd.read_csv(output_path, dtype=str)
+            if "original_index" in done_df.columns:
+                done_df["original_index"] = done_df["original_index"].astype(int)
+                done_indices = set(done_df["original_index"].tolist())
+                results = done_df.to_dict("records")
+                df = df[~df["original_index"].isin(done_indices)]
+                print(f"--- Resuming shard {shard_id}: {len(done_indices)} done, {len(df)} remaining ---")
+        except Exception as e:
+            print(f"Warning checking checkpoint: {e}. Starting shard clean.")
 
     print(f"--- Starting Baseline Inference on shard {shard_id}: {len(df)} samples ---")
 
@@ -92,9 +92,8 @@ def run_baseline_inference(shard_id, num_shards):
         rows = []
 
         for _, row in batch_df.iterrows():
-            code = row["code"]
+            code_content = str(row.get("code", row.get("Code", "")))
             
-            # Formulating structure for chat template compatibility
             user_message = f"""You are an expert C security researcher. Analyze the following code for vulnerabilities.
 
 Structure your response as follows:
@@ -103,7 +102,7 @@ Structure your response as follows:
 3. Danger: Explain why this is dangerous.
 
 CODE:
-{code}
+{code_content}
 
 Final Explanation:"""
 
@@ -112,10 +111,12 @@ Final Explanation:"""
                 {"role": "user", "content": user_message}
             ]
             
-            # Dynamically compile prompt with proper chat templates
             prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             prompts.append(prompt_text)
             rows.append(row)
+
+        if not prompts:
+            continue
 
         inputs = tokenizer(
             prompts,
@@ -130,11 +131,9 @@ Final Explanation:"""
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
                 use_cache=True,
             )
 
-        # Slice strictly the new token generations
         generated_tokens = outputs[:, inputs["input_ids"].shape[1]:]
 
         explanations = tokenizer.batch_decode(
@@ -144,19 +143,21 @@ Final Explanation:"""
         )
 
         for row, explanation in zip(rows, explanations):
-            cwe = row.get("CWE ID", row.get("cwe_id", row.get("cwe", "Unknown")))
-            cve = row.get("CVE ID", row.get("cve_id", row.get("cve", "Unknown")))
-            truth = row.get("truth_description", "N/A")
+            # Dynamic case-insensitive fallbacks for common security dataset labels
+            cwe = row.get("cwe", row.get("CWE ID", row.get("cwe_id", "Unknown")))
+            cve = row.get("cve", row.get("CVE ID", row.get("cve_id", "Unknown")))
+            truth = row.get("truth_description", row.get("description", row.get("Truth", "N/A")))
+            raw_code = row.get("code", row.get("Code", ""))
 
             results.append({
-                "original_index": row["original_index"],
-                "cwe": cwe,
-                "cve": cve,
-                "truth_description": truth,
-                "code": row["code"],
-                "baseline_explanation": explanation.strip(),
-                "shard_id": shard_id,
-                "num_shards": num_shards,
+                "original_index": int(row["original_index"]),
+                "cwe": str(cwe),
+                "cve": str(cve),
+                "truth_description": str(truth),
+                "code": str(raw_code),
+                "baseline_explanation": str(explanation).strip(),
+                "shard_id": int(shard_id),
+                "num_shards": int(num_shards),
             })
 
         batch_counter += 1
@@ -164,7 +165,6 @@ Final Explanation:"""
         if batch_counter % SAVE_EVERY_BATCHES == 0:
             pd.DataFrame(results).to_csv(output_path, index=False)
 
-        # Secure memory cleaning block
         del inputs, outputs, generated_tokens
         torch.cuda.empty_cache()
         gc.collect()
