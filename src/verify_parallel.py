@@ -11,15 +11,18 @@ torch.backends.cuda.matmul.allow_tf32 = True
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_ready_for_judge.csv")
+# Make sure this perfectly matches your merged input dataset file name
+INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_complete.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "judge_shards")
 
-# Change this line (pointing to the offline model in the cluster):
+# --- OFFLINE HUB RESOLUTION CONFIGURATION ---
+# The model directory path where 'hf download' saved snapshot assets
 MODEL_ID = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
+REPO_ID = "meta-llama/Llama-3.1-70B-Instruct"
+CACHE_DIR = "/scratch/hghanesh/.cache/huggingface/hub"
 
 BATCH_SIZE = 1
 MAX_INPUT_TOKENS = 3072
-# Workspace tokens to let the judge explain its reasoning before giving the verdict
 MAX_NEW_TOKENS = 256
 SAVE_EVERY_BATCHES = 5
 
@@ -65,19 +68,26 @@ def run_judge(shard_id, num_shards):
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,  # Kept in bfloat16 to match H100 compute architecture natively
+        bnb_4bit_compute_dtype=torch.bfloat16,  # Matches H100 architecture natively
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    # Force local files only to bypass online Hugging Face metadata checks entirely
+    tokenizer = AutoTokenizer.from_pretrained(
+        REPO_ID,
+        cache_dir=CACHE_DIR,
+        local_files_only=True
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
+        REPO_ID,
         quantization_config=bnb_config,
         device_map="auto",
         low_cpu_mem_usage=True,
+        cache_dir=CACHE_DIR,
+        local_files_only=True
     )
     model.eval()
 
@@ -88,7 +98,7 @@ def run_judge(shard_id, num_shards):
     df["original_index"] = df["original_index"].astype(int)
     df = df.reset_index(drop=True)
     
-    # Partition dataset into shards
+    # Partition dataset into shards using modulo strategy
     df = df[df["original_index"] % num_shards == shard_id].copy()
 
     results = []
