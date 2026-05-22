@@ -14,7 +14,8 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_ready_for_judge.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "judge_shards")
 
-MODEL_ID = "meta-llama/Llama-3.1-70B-Instruct"
+# Change this line (pointing to the offline model in the cluster):
+MODEL_ID = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
 
 BATCH_SIZE = 1
 MAX_INPUT_TOKENS = 3072
