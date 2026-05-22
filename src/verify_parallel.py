@@ -11,18 +11,18 @@ torch.backends.cuda.matmul.allow_tf32 = True
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-# Make sure this perfectly matches your merged input dataset file name
+# Inputs and outputs configuration paths
 INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_complete.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "judge_shards")
 
-# --- OFFLINE HUB RESOLUTION CONFIGURATION ---
-# The model directory path where 'hf download' saved snapshot assets
+# OFFLINE HUB RESOLUTION CONFIGURATION
 MODEL_ID = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
 REPO_ID = "meta-llama/Llama-3.1-70B-Instruct"
 CACHE_DIR = "/scratch/hghanesh/.cache/huggingface/hub"
 
 BATCH_SIZE = 1
 MAX_INPUT_TOKENS = 3072
+# Workspace tokens to let the judge explain its reasoning before giving the verdict
 MAX_NEW_TOKENS = 256
 SAVE_EVERY_BATCHES = 5
 
@@ -68,7 +68,7 @@ def run_judge(shard_id, num_shards):
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,  # Matches H100 architecture natively
+        bnb_4bit_compute_dtype=torch.bfloat16,  # Matches H100 compute architecture natively
     )
 
     # Force local files only to bypass online Hugging Face metadata checks entirely
@@ -81,10 +81,16 @@ def run_judge(shard_id, num_shards):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
+    # Pre-emptively clear CUDA workspace space to resolve allocations
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Using sequential loading mapping and explicit max-allocation boundary enforcement
     model = AutoModelForCausalLM.from_pretrained(
         REPO_ID,
         quantization_config=bnb_config,
-        device_map="auto",
+        device_map="sequential",  # Maps layer-by-layer sequentially to protect memory margins
+        max_memory={0: "72GiB"},   # Restricts model weights to 72GB, leaving 8GB strictly for context context/tokens
         low_cpu_mem_usage=True,
         cache_dir=CACHE_DIR,
         local_files_only=True
@@ -98,7 +104,7 @@ def run_judge(shard_id, num_shards):
     df["original_index"] = df["original_index"].astype(int)
     df = df.reset_index(drop=True)
     
-    # Partition dataset into shards using modulo strategy
+    # Partition dataset into shards using modulo calculation
     df = df[df["original_index"] % num_shards == shard_id].copy()
 
     results = []
