@@ -6,23 +6,26 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
+# Cluster / offline settings
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 torch.backends.cuda.matmul.allow_tf32 = True
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-# Inputs and outputs configuration paths
 INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_complete.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "judge_shards")
 
-# --- OFFLINE HUB RESOLUTION CONFIGURATION ---
-MODEL_ID = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
-REPO_ID = "meta-llama/Llama-3.1-70B-Instruct"
-CACHE_DIR = "/scratch/hghanesh/.cache/huggingface/hub"
+# Use the LOCAL snapshot directly, not the repo id.
+MODEL_PATH = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
 
 BATCH_SIZE = 1
-MAX_INPUT_TOKENS = 3072
-MAX_NEW_TOKENS = 256
+MAX_INPUT_TOKENS = 2048
+MAX_NEW_TOKENS = 128
 SAVE_EVERY_BATCHES = 5
 
 
@@ -51,6 +54,62 @@ def parse_args():
     return parser.parse_args()
 
 
+def print_gpu_status(label):
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        print(
+            f"[GPU] {label}: free={free / 1024**3:.2f} GiB, "
+            f"total={total / 1024**3:.2f} GiB",
+            flush=True,
+        )
+
+
+def load_model_and_tokenizer():
+    print("--- Loading tokenizer from local snapshot ---", flush=True)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_PATH,
+        local_files_only=True,
+        use_fast=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer.padding_side = "left"
+
+    print("--- Loading Llama-3.1-70B-Instruct in 4-bit NF4 ---", flush=True)
+    print_gpu_status("before model load")
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        local_files_only=True,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+
+        device_map="auto",
+        max_memory={0: "72GiB", "cpu": "120GiB"},
+
+        low_cpu_mem_usage=True,
+        offload_folder=os.path.join(PROJECT_ROOT, "offload_70b"),
+    )
+
+    model.eval()
+    print_gpu_status("after model load")
+
+    return tokenizer, model
+
+
 def run_judge(shard_id, num_shards):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -62,53 +121,20 @@ def run_judge(shard_id, num_shards):
     print(f"--- Initializing Llama-3.1-70B Judge | shard {shard_id}/{num_shards} ---")
     print(f"--- Output file: {output_file} ---")
 
-    # 4-bit Quantization Config to compress the 70B model down to ~42GB VRAM so it fits on 1x H100
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,  # Matches H100 compute architecture natively
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        REPO_ID,
-        cache_dir=CACHE_DIR,
-        local_files_only=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    # Pre-emptively clear workspace cache memory allocations
-    torch.cuda.empty_cache()
-    gc.collect()
-
-    # FIX: Combining device_map="auto" with low_cpu_mem_usage=True forces
-    # weights to be converted layer-by-layer in CPU RAM before arriving clean on the H100 VRAM
-    model = AutoModelForCausalLM.from_pretrained(
-        REPO_ID,
-        quantization_config=bnb_config,
-        device_map="auto",  
-        low_cpu_mem_usage=True,
-        cache_dir=CACHE_DIR,
-        local_files_only=True
-    )
-    model.eval()
+    tokenizer, model = load_model_and_tokenizer()
 
     df = pd.read_csv(INPUT_FILE, dtype=str)
+
     if "original_index" not in df.columns:
         df = df.reset_index().rename(columns={"index": "original_index"})
-    
+
     df["original_index"] = df["original_index"].astype(int)
     df = df.reset_index(drop=True)
-    
-    # Partition dataset into shards using modulo calculation
+
     df = df[df["original_index"] % num_shards == shard_id].copy()
 
     results = []
-    done_indices = set()
 
-    # Resume capability logic block
     if os.path.exists(output_file):
         try:
             done_df = pd.read_csv(output_file, dtype=str)
@@ -117,11 +143,15 @@ def run_judge(shard_id, num_shards):
                 done_indices = set(done_df["original_index"].tolist())
                 results = done_df.to_dict("records")
                 df = df[~df["original_index"].isin(done_indices)]
-                print(f"--- Resuming shard {shard_id}: {len(done_indices)} already done, {len(df)} remaining ---")
+                print(
+                    f"--- Resuming shard {shard_id}: "
+                    f"{len(done_indices)} already done, {len(df)} remaining ---",
+                    flush=True,
+                )
         except Exception as e:
-            print(f"Skipping corrupt checkpoint file: {e}")
+            print(f"Skipping corrupt checkpoint file: {e}", flush=True)
 
-    print(f"--- Running shard {shard_id}: {len(df)} samples ---")
+    print(f"--- Running shard {shard_id}: {len(df)} samples ---", flush=True)
 
     batch_counter = 0
 
@@ -130,21 +160,27 @@ def run_judge(shard_id, num_shards):
 
         prompts = []
         rows = []
+
         for _, row in batch_df.iterrows():
             messages = [
-                {"role": "system", "content": "You are a precise, objective senior code auditing judge."},
-                {"role": "user", "content": build_prompt(row)}
+                {
+                    "role": "system",
+                    "content": "You are a precise, objective senior code auditing judge.",
+                },
+                {
+                    "role": "user",
+                    "content": build_prompt(row),
+                },
             ]
+
             prompt = tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
+
             prompts.append(prompt)
             rows.append(row)
-
-        if not prompts:
-            continue
 
         inputs = tokenizer(
             prompts,
@@ -152,17 +188,23 @@ def run_judge(shard_id, num_shards):
             padding=True,
             truncation=True,
             max_length=MAX_INPUT_TOKENS,
-        ).to("cuda")
+        )
 
-        with torch.no_grad():
+
+        first_device = next(model.parameters()).device
+        inputs = {k: v.to(first_device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=MAX_NEW_TOKENS,
                 do_sample=False,
                 use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
             )
 
         generated_tokens = outputs[:, inputs["input_ids"].shape[1]:]
+
         responses = tokenizer.batch_decode(
             generated_tokens,
             skip_special_tokens=True,
@@ -171,17 +213,19 @@ def run_judge(shard_id, num_shards):
 
         for row, response in zip(rows, responses):
             response_text = response.strip()
-            
             verdict_segment = response_text.split("Final Verdict:")[-1].strip().upper()
             is_correct = "YES" in verdict_segment
 
             output_row = row.to_dict()
-            output_row.update({
-                "judge_response": response_text,
-                "is_correct": is_correct,
-                "shard_id": int(shard_id),
-                "num_shards": int(num_shards),
-            })
+            output_row.update(
+                {
+                    "judge_response": response_text,
+                    "is_correct": is_correct,
+                    "shard_id": int(shard_id),
+                    "num_shards": int(num_shards),
+                }
+            )
+
             results.append(output_row)
 
         batch_counter += 1
@@ -194,7 +238,7 @@ def run_judge(shard_id, num_shards):
         gc.collect()
 
     pd.DataFrame(results).to_csv(output_file, index=False)
-    print(f"--- Shard {shard_id} complete. Saved to {output_file} ---")
+    print(f"--- Shard {shard_id} complete. Saved to {output_file} ---", flush=True)
 
 
 if __name__ == "__main__":
