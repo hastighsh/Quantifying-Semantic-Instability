@@ -15,14 +15,13 @@ PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "baseline_results_complete.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "judge_shards")
 
-# OFFLINE HUB RESOLUTION CONFIGURATION
+# --- OFFLINE HUB RESOLUTION CONFIGURATION ---
 MODEL_ID = "/scratch/hghanesh/.cache/huggingface/hub/models--meta-llama--Llama-3.1-70B-Instruct/snapshots/1605565b47bb9346c5515c34102e054115b4f98b"
 REPO_ID = "meta-llama/Llama-3.1-70B-Instruct"
 CACHE_DIR = "/scratch/hghanesh/.cache/huggingface/hub"
 
 BATCH_SIZE = 1
 MAX_INPUT_TOKENS = 3072
-# Workspace tokens to let the judge explain its reasoning before giving the verdict
 MAX_NEW_TOKENS = 256
 SAVE_EVERY_BATCHES = 5
 
@@ -71,7 +70,6 @@ def run_judge(shard_id, num_shards):
         bnb_4bit_compute_dtype=torch.bfloat16,  # Matches H100 compute architecture natively
     )
 
-    # Force local files only to bypass online Hugging Face metadata checks entirely
     tokenizer = AutoTokenizer.from_pretrained(
         REPO_ID,
         cache_dir=CACHE_DIR,
@@ -81,15 +79,16 @@ def run_judge(shard_id, num_shards):
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    # Pre-emptively clear CUDA workspace space to resolve allocations
+    # Pre-emptively clear workspace cache memory allocations
     torch.cuda.empty_cache()
     gc.collect()
 
-    # CRITICAL FIX: Mapping explicitly to GPU 0 avoids 'accelerate' framework deadlocks completely
+    # FIX: Combining device_map="auto" with low_cpu_mem_usage=True forces
+    # weights to be converted layer-by-layer in CPU RAM before arriving clean on the H100 VRAM
     model = AutoModelForCausalLM.from_pretrained(
         REPO_ID,
         quantization_config=bnb_config,
-        device_map={"": 0},  
+        device_map="auto",  
         low_cpu_mem_usage=True,
         cache_dir=CACHE_DIR,
         local_files_only=True
@@ -173,7 +172,6 @@ def run_judge(shard_id, num_shards):
         for row, response in zip(rows, responses):
             response_text = response.strip()
             
-            # Extract final verdict block safely
             verdict_segment = response_text.split("Final Verdict:")[-1].strip().upper()
             is_correct = "YES" in verdict_segment
 
