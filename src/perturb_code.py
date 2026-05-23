@@ -1,194 +1,218 @@
 import os
-import re
 import pandas as pd
 from tree_sitter import Language, Parser
 import tree_sitter_c
 
-# 1. Structural Path Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
 INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "filtered_experimental_set.csv")
 OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "perturbed_set.csv")
 
-# Initialize Tree-Sitter Parser for C
 C_LANGUAGE = Language(tree_sitter_c.language())
 parser = Parser(C_LANGUAGE)
 
 
 def get_node_text(node, source_bytes):
-    """Safely extracts text string from a specific AST node range."""
     return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
 
 
-def ast_rename_variables(code_str):
+def collect_identifiers_from_declarator(node, source_bytes, out_set):
     """
-    AST-based Lexical Perturbation: Maps and renames local variable identifiers
-    while ignoring standard C keywords, functions, macros, and string literals.
+    Recursively unwrap declarators until we reach the actual local identifier name.
     """
+    if node is None:
+        return
+
+    if node.type == "identifier":
+        out_set.add(get_node_text(node, source_bytes))
+        return
+
+    declarator = node.child_by_field_name("declarator")
+    if declarator is not None:
+        collect_identifiers_from_declarator(declarator, source_bytes, out_set)
+
+
+def ast_scope_pure_perturbation(code_str, index):
     source_bytes = code_str.encode("utf-8")
     tree = parser.parse(source_bytes)
-    root_node = tree.root_node
+    root = tree.root_node
 
-    keywords = {
-        'int', 'char', 'float', 'double', 'struct', 'if', 'else', 'while', 'for', 
-        'return', 'break', 'continue', 'switch', 'case', 'default', 'sizeof', 
-        'static', 'const', 'void', 'unsigned', 'signed', 'long', 'short', 'NULL'
+    declared_names = set()
+
+    # PASS 1: COLLECT TRUE LOCAL VARIABLES + PARAMETERS
+    def find_declarations(node):
+        if node.type == "parameter_declaration":
+            declarator = node.child_by_field_name("declarator")
+            collect_identifiers_from_declarator(declarator, source_bytes, declared_names)
+
+        elif node.type == "declaration":
+            declarator = node.child_by_field_name("declarator")
+            if declarator is not None:
+                collect_identifiers_from_declarator(declarator, source_bytes, declared_names)
+
+            for child in node.children:
+                if child.type == "init_declarator":
+                    declarator = child.child_by_field_name("declarator")
+                    collect_identifiers_from_declarator(declarator, source_bytes, declared_names)
+
+        for child in node.children:
+            find_declarations(child)
+
+    find_declarations(root)
+
+    # BUILD RENAME MAP
+    rename_map = {
+        old_name: f"var_{i + 1}"
+        for i, old_name in enumerate(sorted(declared_names))
     }
 
-    identifiers_to_rename = set()
+    # PASS 2: FIND SAFE IDENTIFIER USAGES
+    mutation_targets = []
 
-    def traverse_for_identifiers(node):
-        # We target specific identifier types while ensuring we don't rename system function names
+    def should_skip_identifier(node):
+        parent = node.parent
+        if parent is None:
+            return False
+
+        # 1. Never rename function names inside call expressions
+        if parent.type == "call_expression":
+            if parent.child_by_field_name("function") == node:
+                return True
+
+        # 2. FIXED NESTED STRUCT ACCESS PROTECTION:
+        # Trace up through all field_expression parents. If our identifier node 
+        # is EVER found acting as a field name rather than the base argument 
+        # object at any level in the chain, skip it completely.
+        current = node
+        while current.parent is not None:
+            p = current.parent
+            if p.type == "field_expression":
+                # If it's not the base object of this specific field expression, it's a property.
+                if p.child_by_field_name("argument") != current:
+                    return True
+            current = p
+
+        return False
+
+    def collect_usage_targets(node):
         if node.type == "identifier":
-            parent = node.parent
-            # Skip if it's a function declaration identifier or an external macro call name
-            if parent and parent.type in ["function_declarator", "call_expression"] and parent.child_by_field_name("name") == node:
-                pass
-            else:
-                word = get_node_text(node, source_bytes)
-                if word not in keywords and len(word) > 1 and not word.isupper():
-                    identifiers_to_rename.add((node.start_byte, node.end_byte, word))
-        
+            name = get_node_text(node, source_bytes)
+            if name in rename_map:
+                if not should_skip_identifier(node):
+                    mutation_targets.append((node.start_byte, node.end_byte, name))
+
         for child in node.children:
-            traverse_for_identifiers(child)
+            collect_usage_targets(child)
 
-    traverse_for_identifiers(root_node)
+    collect_usage_targets(root)
 
-    # Sort identifiers by reverse byte order to update text from back to front without misaligning indices
-    sorted_occurrences = sorted(list(identifiers_to_rename), key=lambda x: x[0], reverse=True)
-    
-    # Create distinct mappings for old variable names
-    unique_names = sorted(list(set([x[2] for x in sorted_occurrences])))
-    var_mapping = {old: f"var_{i+1}" for i, old in enumerate(unique_names)}
+    # APPLY MUTATIONS BACKWARDS
+    mutable = bytearray(source_bytes)
+    unique_targets = sorted(
+        set(mutation_targets),
+        key=lambda x: x[0],
+        reverse=True
+    )
 
-    # Modify the string via byte slices
-    modified_bytes = bytearray(source_bytes)
-    for start_byte, end_byte, old_name in sorted_occurrences:
-        new_name = var_mapping[old_name]
-        modified_bytes[start_byte:end_byte] = new_name.encode("utf-8")
+    for start, end, old_name in unique_targets:
+        new_name = rename_map[old_name]
+        mutable[start:end] = new_name.encode("utf-8")
 
-    return modified_bytes.decode("utf-8")
+    output_code = mutable.decode("utf-8", errors="ignore")
+
+    # OPTIONAL LOOP PERTURBATION
+    if index % 2 == 0:
+        output_code = loop_inversion_ast(output_code)
+
+    return output_code
 
 
-def ast_transform_loops(code_str, index):
-    """
-    AST-based Logic Transformation: Identifies 'for' loops structures natively
-    and refactors them into logically identical 'while' structures for even rows.
-    """
-    # Maintain a 50/50 balance across dataset slices based on row evaluation indices
-    if index % 2 != 0:
-        return code_str
-
+def loop_inversion_ast(code_str):
     source_bytes = code_str.encode("utf-8")
     tree = parser.parse(source_bytes)
-    root_node = tree.root_node
+    root = tree.root_node
 
-    for_loops = []
-
-    def find_for_loops(node):
+    loops = []
+    def collect_loops(node):
         if node.type == "for_statement":
-            for_loops.append(node)
+            loops.append(node)
         for child in node.children:
-            find_for_loops(child)
+            collect_loops(child)
 
-    find_for_loops(root_node)
+    collect_loops(root)
+    updated = code_str
 
-    if not for_loops:
-        return code_str
+    for loop in sorted(loops, key=lambda n: n.start_byte, reverse=True):
+        current_bytes = updated.encode("utf-8")
+        current_tree = parser.parse(current_bytes)
+        current_root = current_tree.root_node
 
-    # Process back to front to ensure character positions remain aligned
-    modified_code = code_str
-    for loop_node in sorted(for_loops, key=lambda n: n.start_byte, reverse=True):
-        # Extract init, condition, update, and body blocks
-        init_node = loop_node.child_by_field_name("initializer")
-        cond_node = loop_node.child_by_field_name("condition")
-        update_node = loop_node.child_by_field_name("update")
-        body_node = loop_node.child_by_field_name("body")
+        match = None
+        def locate(node):
+            nonlocal match
+            if match is not None:
+                return
+            if node.type == "for_statement" and node.start_byte == loop.start_byte:
+                match = node
+                return
+            for child in node.children:
+                locate(child)
 
-        if not (init_node and cond_node and update_node and body_node):
+        locate(current_root)
+
+        if match is None:
             continue
 
-        loop_bytes = modified_code.encode("utf-8")
-        init_txt = get_node_text(init_node, loop_bytes)
-        cond_txt = get_node_text(cond_node, loop_bytes)
-        update_txt = get_node_text(update_node, loop_bytes)
-        body_txt = get_node_text(body_node, loop_bytes)
+        init = match.child_by_field_name("initializer")
+        cond = match.child_by_field_name("condition")
+        update = match.child_by_field_name("update")
+        body = match.child_by_field_name("body")
 
-        # Handle inner content braces cleaning
-        if body_txt.startswith("{") and body_txt.endswith("}"):
-            body_core = body_txt[1:-1].strip()
-        else:
-            body_core = body_txt.strip()
+        if not (init and cond and update and body):
+            continue
 
-        # Re-synthesize structurally accurate C code block
-        while_structure = (
-            f"{init_txt};\n"
-            f"while ({cond_txt}) {{\n"
-            f"    {body_core}\n"
-            f"    {update_txt};\n"
+        init_t = get_node_text(init, current_bytes)
+        cond_t = get_node_text(cond, current_bytes)
+        update_t = get_node_text(update, current_bytes)
+        body_t = get_node_text(body, current_bytes)
+
+        body_inner = body_t[1:-1].strip() if body_t.startswith("{") and body_t.endswith("}") else body_t.strip()
+
+        replacement = (
+            f"{init_t};\n"
+            f"while ({cond_t}) {{\n"
+            f"    {body_inner}\n"
+            f"    {update_t};\n"
             f"}}"
         )
-        
-        start, end = loop_node.start_byte, loop_node.end_byte
-        modified_code = modified_code[:start] + while_structure + modified_code[end:]
 
-    return modified_code
+        updated = updated[:match.start_byte] + replacement + updated[match.end_byte:]
 
-
-def regex_ternary_fallback(code):
-    """
-    Robust Regex-based fallback pattern to compress standard conditional variable
-    assignments into concise inline ternary variants.
-    """
-    ternary_pattern = r'if\s*\(([^)]+)\)\s*{\s*(\w+)\s*=\s*([^;]+);\s*}\s*else\s*{\s*\2\s*=\s*([^;]+);\s*}'
-    return re.sub(ternary_pattern, r'\2 = (\1) ? \3 : \4;', code)
+    return updated
 
 
-def run_perturbation():
-    print("=" * 60)
-    print("--- RUNNING ADVANCED AST PERTURBATION FRAMEWORK ---")
-    print("=" * 60)
-    
+def main():
+    print("\n--- Running Scope-Corrected AST Mutation Engine ---\n")
     if not os.path.exists(INPUT_PATH):
-        print(f"[CRITICAL ERROR] Target input workspace missing at: {INPUT_PATH}")
+        print(f"ERROR: Missing file: {INPUT_PATH}")
         return
 
     df = pd.read_csv(INPUT_PATH)
-    perturbed_list = []
-
-    print(f"Imported {len(df)} pristine high-quality baseline rows.")
+    perturbed = []
 
     for idx, row in df.iterrows():
-        original_code = row['code']
-        
         try:
-            # Step 1: Structural Loop Transformation (AST Engine)
-            code_step1 = ast_transform_loops(original_code, idx)
-            
-            # Step 2: Idiomatic Assignment Minimization (Regex Filter)
-            code_step2 = regex_ternary_fallback(code_step1)
-            
-            # Step 3: Local Scope Variable Scrambling (AST Engine)
-            code_final = ast_rename_variables(code_step2)
-            
-            perturbed_list.append(code_final)
-        except Exception as err:
-            print(f"[WARNING] AST failure on row idx {idx}, employing strict fallback routing. Error: {err}")
-            perturbed_list.append(original_code)
+            mutated = ast_scope_pure_perturbation(str(row["code"]), idx)
+        except Exception as e:
+            print(f"FAILED ROW {idx}: {e}")
+            mutated = row["code"]
+        perturbed.append(mutated)
 
-    df['perturbed_code'] = perturbed_list
-
-    # Output Management
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    df["perturbed_code"] = perturbed
     df.to_csv(OUTPUT_PATH, index=False)
-    
-    print("-" * 60)
-    print("--- SUCCESS: PERTURBED DATA EXPERIMENTAL WORKSPACE COMPILED ---")
-    print(f"Total Records Generated: {len(df)}")
-    print(f"Saved directly to target path: {OUTPUT_PATH}")
-    print("=" * 60)
+    print(f"\nSUCCESS: Compiled pristine experimental workspace at:\n{OUTPUT_PATH}\n")
 
 
 if __name__ == "__main__":
-    run_perturbation()
+    main()
