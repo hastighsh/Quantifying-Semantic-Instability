@@ -1,112 +1,194 @@
-import pandas as pd
-import re
 import os
+import re
+import pandas as pd
+from tree_sitter import Language, Parser
+import tree_sitter_c
 
-# 1. Path Setup
+# 1. Structural Path Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-# Inputs/Outputs
 INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "filtered_experimental_set.csv")
 OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "perturbed_set.csv")
 
-def rename_variables(code):
+# Initialize Tree-Sitter Parser for C
+C_LANGUAGE = Language(tree_sitter_c.language())
+parser = Parser(C_LANGUAGE)
+
+
+def get_node_text(node, source_bytes):
+    """Safely extracts text string from a specific AST node range."""
+    return source_bytes[node.start_byte:node.end_byte].decode("utf-8", errors="ignore")
+
+
+def ast_rename_variables(code_str):
     """
-    Lexical perturbation: Renames identifiers to var_1, var_2, etc., 
-    while ignoring C-style keywords and strings.
+    AST-based Lexical Perturbation: Maps and renames local variable identifiers
+    while ignoring standard C keywords, functions, macros, and string literals.
     """
+    source_bytes = code_str.encode("utf-8")
+    tree = parser.parse(source_bytes)
+    root_node = tree.root_node
+
     keywords = {
         'int', 'char', 'float', 'double', 'struct', 'if', 'else', 'while', 'for', 
         'return', 'break', 'continue', 'switch', 'case', 'default', 'sizeof', 
         'static', 'const', 'void', 'unsigned', 'signed', 'long', 'short', 'NULL'
     }
 
-    # Pattern: Group 1 captures strings; Group 2 captures potential identifiers
-    pattern = r'("[^"]*")|(\b[a-zA-Z_][a-zA-Z0-9_]*\b)'
+    identifiers_to_rename = set()
 
-    # 1. First pass: Identify variables to rename
-    identifiers = set()
-    for match in re.finditer(pattern, code):
-        if match.group(2):  # If it's a word and not a string
-            word = match.group(2)
-            if word not in keywords and len(word) > 1:
-                identifiers.add(word)
+    def traverse_for_identifiers(node):
+        # We target specific identifier types while ensuring we don't rename system function names
+        if node.type == "identifier":
+            parent = node.parent
+            # Skip if it's a function declaration identifier or an external macro call name
+            if parent and parent.type in ["function_declarator", "call_expression"] and parent.child_by_field_name("name") == node:
+                pass
+            else:
+                word = get_node_text(node, source_bytes)
+                if word not in keywords and len(word) > 1 and not word.isupper():
+                    identifiers_to_rename.add((node.start_byte, node.end_byte, word))
+        
+        for child in node.children:
+            traverse_for_identifiers(child)
 
-    # 2. Create mapping (sorted by length descending to prevent partial replacement)
-    targets = sorted(list(identifiers), key=len, reverse=True)
-    mapping = {old: f"var_{i+1}" for i, old in enumerate(targets)}
+    traverse_for_identifiers(root_node)
 
-    # 3. Second pass: Replace only Group 2 matches found in mapping
-    def replace_func(match):
-        if match.group(1): 
-            return match.group(1)  # Return strings untouched
-        word = match.group(2)
-        return mapping.get(word, word)
-
-    return re.sub(pattern, replace_func, code)
-
-def transform_logic(code, index):
-    """
-    Applies structural changes. 
-    Even rows get 'while' conversion, odd rows stay 'for' for 50/50 split.
-    """
-    # Regex to capture for(init; cond; inc) {
-    for_pattern = r'for\s*\(([^;]*);([^;]*);([^)]*)\)\s*\{'
+    # Sort identifiers by reverse byte order to update text from back to front without misaligning indices
+    sorted_occurrences = sorted(list(identifiers_to_rename), key=lambda x: x[0], reverse=True)
     
-    def for_replacer(match):
-        init, cond, inc = match.groups()
-        # Guaranteed 50/50 split based on the row number
-        if index % 2 == 0: 
-            return f"{init.strip()};\n    while({cond.strip()}) {{\n        {inc.strip()};"
+    # Create distinct mappings for old variable names
+    unique_names = sorted(list(set([x[2] for x in sorted_occurrences])))
+    var_mapping = {old: f"var_{i+1}" for i, old in enumerate(unique_names)}
+
+    # Modify the string via byte slices
+    modified_bytes = bytearray(source_bytes)
+    for start_byte, end_byte, old_name in sorted_occurrences:
+        new_name = var_mapping[old_name]
+        modified_bytes[start_byte:end_byte] = new_name.encode("utf-8")
+
+    return modified_bytes.decode("utf-8")
+
+
+def ast_transform_loops(code_str, index):
+    """
+    AST-based Logic Transformation: Identifies 'for' loops structures natively
+    and refactors them into logically identical 'while' structures for even rows.
+    """
+    # Maintain a 50/50 balance across dataset slices based on row evaluation indices
+    if index % 2 != 0:
+        return code_str
+
+    source_bytes = code_str.encode("utf-8")
+    tree = parser.parse(source_bytes)
+    root_node = tree.root_node
+
+    for_loops = []
+
+    def find_for_loops(node):
+        if node.type == "for_statement":
+            for_loops.append(node)
+        for child in node.children:
+            find_for_loops(child)
+
+    find_for_loops(root_node)
+
+    if not for_loops:
+        return code_str
+
+    # Process back to front to ensure character positions remain aligned
+    modified_code = code_str
+    for loop_node in sorted(for_loops, key=lambda n: n.start_byte, reverse=True):
+        # Extract init, condition, update, and body blocks
+        init_node = loop_node.child_by_field_name("initializer")
+        cond_node = loop_node.child_by_field_name("condition")
+        update_node = loop_node.child_by_field_name("update")
+        body_node = loop_node.child_by_field_name("body")
+
+        if not (init_node and cond_node and update_node and body_node):
+            continue
+
+        loop_bytes = modified_code.encode("utf-8")
+        init_txt = get_node_text(init_node, loop_bytes)
+        cond_txt = get_node_text(cond_node, loop_bytes)
+        update_txt = get_node_text(update_node, loop_bytes)
+        body_txt = get_node_text(body_node, loop_bytes)
+
+        # Handle inner content braces cleaning
+        if body_txt.startswith("{") and body_txt.endswith("}"):
+            body_core = body_txt[1:-1].strip()
         else:
-            return match.group(0)
+            body_core = body_txt.strip()
 
-    code = re.sub(for_pattern, for_replacer, code)
+        # Re-synthesize structurally accurate C code block
+        while_structure = (
+            f"{init_txt};\n"
+            f"while ({cond_txt}) {{\n"
+            f"    {body_core}\n"
+            f"    {update_txt};\n"
+            f"}}"
+        )
+        
+        start, end = loop_node.start_byte, loop_node.end_byte
+        modified_code = modified_code[:start] + while_structure + modified_code[end:]
 
-    # Ternary transformation (applied to all applicable blocks)
+    return modified_code
+
+
+def regex_ternary_fallback(code):
+    """
+    Robust Regex-based fallback pattern to compress standard conditional variable
+    assignments into concise inline ternary variants.
+    """
     ternary_pattern = r'if\s*\(([^)]+)\)\s*{\s*(\w+)\s*=\s*([^;]+);\s*}\s*else\s*{\s*\2\s*=\s*([^;]+);\s*}'
-    code = re.sub(ternary_pattern, r'\2 = (\1) ? \3 : \4;', code)
+    return re.sub(ternary_pattern, r'\2 = (\1) ? \3 : \4;', code)
 
-    return code
 
 def run_perturbation():
-    print("--- Starting Perturbation Stage ---")
+    print("=" * 60)
+    print("--- RUNNING ADVANCED AST PERTURBATION FRAMEWORK ---")
+    print("=" * 60)
     
     if not os.path.exists(INPUT_PATH):
-        print(f"ERROR: Could not find {INPUT_PATH}")
+        print(f"[CRITICAL ERROR] Target input workspace missing at: {INPUT_PATH}")
         return
 
     df = pd.read_csv(INPUT_PATH)
     perturbed_list = []
 
-    print(f"Processing {len(df)} samples...")
+    print(f"Imported {len(df)} pristine high-quality baseline rows.")
 
     for idx, row in df.iterrows():
-        # 1. Structural change (passes index for consistency)
-        code_transformed = transform_logic(row['code'], idx)
+        original_code = row['code']
         
-        # 2. Lexical change (Variable renaming)
-        code_final = rename_variables(code_transformed)
-        
-        perturbed_list.append(code_final)
+        try:
+            # Step 1: Structural Loop Transformation (AST Engine)
+            code_step1 = ast_transform_loops(original_code, idx)
+            
+            # Step 2: Idiomatic Assignment Minimization (Regex Filter)
+            code_step2 = regex_ternary_fallback(code_step1)
+            
+            # Step 3: Local Scope Variable Scrambling (AST Engine)
+            code_final = ast_rename_variables(code_step2)
+            
+            perturbed_list.append(code_final)
+        except Exception as err:
+            print(f"[WARNING] AST failure on row idx {idx}, employing strict fallback routing. Error: {err}")
+            perturbed_list.append(original_code)
 
     df['perturbed_code'] = perturbed_list
 
-    # Ensure output directory exists
+    # Output Management
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    
-    # Save results
     df.to_csv(OUTPUT_PATH, index=False)
     
-    print("-" * 30)
-    print("--- Success! Perturbations applied ---")
-    print(f"Total samples: {len(df)}")
-    print(f"Saved to: {OUTPUT_PATH}")
+    print("-" * 60)
+    print("--- SUCCESS: PERTURBED DATA EXPERIMENTAL WORKSPACE COMPILED ---")
+    print(f"Total Records Generated: {len(df)}")
+    print(f"Saved directly to target path: {OUTPUT_PATH}")
+    print("=" * 60)
 
-    # Preview first sample
-    print("\n--- PREVIEW (Sample 0) ---")
-    print("ORIGINAL (Start):\n", df.iloc[0]['code'][:100], "...")
-    print("\nPERTURBED (Start):\n", df.iloc[0]['perturbed_code'][:100], "...")
 
 if __name__ == "__main__":
     run_perturbation()

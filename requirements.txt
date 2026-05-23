@@ -3,6 +3,8 @@ torch>=2.0.0
 transformers>=4.38.0
 accelerate>=0.27.0
 sentence-transformers  # Semantic Similarity (SBERT)
+tree-sitter 
+tree-sitter-c
 
 # --- Data Handling & Datasets ---
 datasets               # To load Big-Vul/D2A from HuggingFace
