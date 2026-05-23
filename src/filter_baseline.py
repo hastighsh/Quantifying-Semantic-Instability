@@ -96,7 +96,7 @@ def main():
     print(f"Original Samples Evaluated: {len(df)}")
     print(f"High-Quality Baseline Samples Kept (YES): {len(final_set)}")
     print(f"Discarded (Inaccurate / Flawed Explanations): {len(df) - len(final_set)}")
-    print(f"Clean experimental workspace saved directly to: {output_path}")
+    print(f"Clean experimental workspace saved directly to: {OUTPUT_PATH}")
 
     # Run the comprehensive metrics and survival engine
     analyze_results(df, os.path.basename(INPUT_PATH))
