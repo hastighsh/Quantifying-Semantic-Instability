@@ -1,10 +1,10 @@
+import os
+import re
 import pandas as pd
 import numpy as np
 import torch
 import seaborn as sns
 import matplotlib.pyplot as plt
-import re
-import os
 from sentence_transformers import SentenceTransformer, util
 from scipy import stats
 
@@ -14,11 +14,27 @@ try:
 except ImportError:
     HAS_POSTHOC = False
 
-# PATH SETUP
+# 1. Structural Configuration Setup
 PROJECT_ROOT = os.getcwd()
-INPUT_FILE = os.path.join(PROJECT_ROOT, "results", "rq1_results_qwen14b_transformers.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "results", "analysis_v3")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Path dictionaries matching your 3-tier experimental framework
+MODEL_TIERS = {
+    "Low-Tier (7B)": {
+        "path": os.path.join(PROJECT_ROOT, "results", "rq1_results_qwen7b_transformers.csv"),
+        "color": "#4A90E2"
+    },
+    "Mid-Tier (14B)": {
+        "path": os.path.join(PROJECT_ROOT, "results", "rq1_results_qwen14b_transformers.csv"),
+        "color": "#50E3C2"
+    },
+    "High-Tier (32B)": {
+        "path": os.path.join(PROJECT_ROOT, "results", "rq1_results_qwen32b_transformers.csv"),
+        "color": "#B8E986"
+    }
+}
+
 
 def calculate_jaccard(text1, text2):
     """Calculates keyword-based Jaccard similarity to detect categorical shifts."""
@@ -26,23 +42,23 @@ def calculate_jaccard(text1, text2):
     words1 = set(pattern.findall(str(text1).lower()))
     words2 = set(pattern.findall(str(text2).lower()))
     
-    if not words1 and not words2: return 1.0 
+    if not words1 and not words2: 
+        return 1.0 
     intersection = len(words1.intersection(words2))
     union = len(words1.union(words2))
     return intersection / union if union > 0 else 1.0
 
-def analyze_rq1():
-    print("--- 1. Data Preparation & Cleaning ---")
-    if not os.path.exists(INPUT_FILE):
-        print(f"ERROR: File not found at {INPUT_FILE}")
-        return
 
-    raw_df = pd.read_csv(INPUT_FILE)
+def process_single_tier(file_path, st_model, device):
+    """ Cleans, extracts, and computes embedding-space distances for a target file. """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Missing core empirical file path at: {file_path}")
+
+    raw_df = pd.read_csv(file_path)
     
-    # Filter out inference failures
+    # Filter out inference drops
     raw_df = raw_df[~raw_df['explanation'].str.contains("INFERENCE_ERROR", na=False)]
     
-    # Pivot to compare Baseline vs Perturbed
     df_base = raw_df[raw_df['experiment_type'] == 'baseline'].rename(
         columns={'explanation': 'base_exp', 'code_used': 'base_code'}
     )
@@ -50,26 +66,21 @@ def analyze_rq1():
         columns={'explanation': 'pert_exp', 'code_used': 'pert_code'}
     )
     
-    # Merge on 'index' - keep 'cwe' from the baseline side
-    df = pd.merge(df_base[['index', 'cwe', 'base_exp', 'base_code']], 
-                  df_pert[['index', 'pert_exp', 'pert_code']], on='index')
+    df = pd.merge(
+        df_base[['index', 'cwe', 'base_exp', 'base_code']], 
+        df_pert[['index', 'pert_exp', 'pert_code']], 
+        on='index'
+    )
 
-    print("--- 2. Computing Multi-Modal Metrics ---")
-    st_model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    base_embs = st_model.encode(df['base_exp'].tolist(), convert_to_tensor=True)
-    pert_embs = st_model.encode(df['pert_exp'].tolist(), convert_to_tensor=True)
+    # Tensor embedding logic processing assigned cleanly to active device space
+    base_embs = st_model.encode(df['base_exp'].tolist(), convert_to_tensor=True, device=device)
+    pert_embs = st_model.encode(df['pert_exp'].tolist(), convert_to_tensor=True, device=device)
     
     cos_sims = util.pytorch_cos_sim(base_embs, pert_embs).diagonal().tolist()
     df['semantic_variance'] = [1 - s for s in cos_sims]
-
-    # Jaccard for Keyword/CWE Shifts
     df['jaccard_instability'] = 1 - df.apply(lambda x: calculate_jaccard(x['base_exp'], x['pert_exp']), axis=1)
-
-    # Proxy for Code Complexity Increase
     df['code_len_increase'] = df['pert_code'].str.len() - df['base_code'].str.len()
 
-    # Categorize Perturbations
     def get_pert_type(row):
         base = str(row['base_code']).lower()
         pert = str(row['pert_code']).lower()
@@ -78,149 +89,138 @@ def analyze_rq1():
         return 'Lexical (Renaming)'
     
     df['perturbation_type'] = df.apply(get_pert_type, axis=1)
+    return df
 
-    print("--- 3. Statistical Analysis ---")
-    
-    # A. Filtering for Statistical Robustness
-    # Exclude groups with n < 2 for inferential tests (e.g., Ternary with n=1)
-    df_filtered = df[df['perturbation_type'] != 'Structural (Ternary)'].copy()
-    n_samples = len(df)
-    n_filtered = len(df_filtered)
 
-    # B. Paired Significance Test
-    # Testing whether perturbations caused a non-zero change from baseline.
-    wilc_stat, p_wilcoxon = stats.wilcoxon(df['semantic_variance'])
-    
-    # MANUAL Z-SCORE CONVERSION (Safely handles tiny p-values to avoid r = inf)
-    # Standard Wilcoxon Mean: E[W] = n(n+1)/4
-    # Standard Wilcoxon SD: SE[W] = sqrt(n(n+1)(2n+1)/24)
-    mu_w = n_samples * (n_samples + 1) / 4
-    sigma_w = np.sqrt((n_samples * (n_samples + 1) * (2 * n_samples + 1)) / 24)
-    
-    # Standardized Z-score
-    z_score = (wilc_stat - mu_w) / sigma_w
-    
-    # Effect Size (r = abs(z) / sqrt(N))
-    r_wilcoxon = abs(z_score) / np.sqrt(n_samples)
-
-    # C. Kruskal-Wallis (Group Differences - Filtered)
-    groups_dict = {name: group['semantic_variance'].values 
-                   for name, group in df_filtered.groupby('perturbation_type')}
-    h_stat, p_kruskal = stats.kruskal(*groups_dict.values())
-    
-    # Effect Size for Kruskal-Wallis (Epsilon-squared: ε²)
-    epsilon_sq = h_stat / ((n_filtered**2 - 1) / (n_filtered + 1))
-
-    # D. 95% Normal Approximation Confidence Interval
-    mean_variance = df['semantic_variance'].mean()
-    std_err = df['semantic_variance'].std() / np.sqrt(n_samples)
-    ci_low = mean_variance - (1.96 * std_err)
-    ci_high = mean_variance + (1.96 * std_err)
-
-    # Logging Results
-    print(f"1. Paired Wilcoxon (Baseline vs Perturbed):")
-    print(f"   p-value: {p_wilcoxon:.8e}")
-    print(f"   Effect Size (r): {r_wilcoxon:.4f}")
-    
-    print(f"\n2. Kruskal-Wallis (Lexical vs Structural While):")
-    print(f"   Note: Ternary excluded from inferential test due to n=1.")
-    print(f"   H-statistic: {h_stat:.4f}, p-value: {p_kruskal:.8f}")
-    print(f"   Effect Size (ε²): {epsilon_sq:.4f}")
-    
-    print(f"\n3. Descriptive Rigor:")
-    print(f"   Mean Semantic Variance: {mean_variance:.4f}")
-    print(f"   95% Normal Approximation CI: [{ci_low:.4f}, {ci_high:.4f}]")
-
-    # E. Robustness Check: Sample Counts
-    print("\n4. Group Robustness (n per category):")
-    print(df['perturbation_type'].value_counts())
-    
-    # F. Post-hoc Analysis
-    posthoc_df = None
-    if p_kruskal < 0.05 and HAS_POSTHOC:
-        print("\n>> SIGNIFICANT DIFFERENCES. Running Dunn's Test...")
-        posthoc_df = sp.posthoc_dunn(df_filtered, val_col='semantic_variance', group_col='perturbation_type', p_adjust='holm')
-        posthoc_df.to_csv(os.path.join(OUTPUT_DIR, "rq1_posthoc_pairwise.csv"))
-
-    # CWE Sensitivity Summary (n >= 3)
-    cwe_summary = df.groupby('cwe')['semantic_variance'].agg(['mean', 'std', 'count'])
-    cwe_summary = cwe_summary[cwe_summary['count'] >= 3].sort_values(by='mean', ascending=False)
-
-    print("--- 4. Visualization Suite (Individual Plots) ---")
+def generate_unified_reports(compiled_data, stats_records):
+    """ Compiles full multi-model performance plots and LaTeX-ready data frames. """
     sns.set_theme(style="whitegrid")
-
-    # 1. Boxenplot: Instability Distribution
-    plt.figure(figsize=(10, 6))
-    sns.boxenplot(x='perturbation_type', y='semantic_variance', data=df, hue='perturbation_type', palette="Set2", legend=False)
-    plt.title(f"Semantic Instability by Transformation (p_kruskal={p_kruskal:.4f})", fontweight='bold')
-    plt.savefig(os.path.join(OUTPUT_DIR, "1_instability_distribution.png"), dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # 2. CWE Barplot: Fragility Ranking
-    plt.figure(figsize=(8, 6))
     plt.rcParams["font.family"] = "serif"
-    plt.rcParams["font.serif"] = ["Times New Roman", "Liberation Serif", "DejaVu Serif", "serif"]
     
-    top_cwe = cwe_summary.head(10)
-    global_mean = df['semantic_variance'].mean()
-
-    ax = sns.barplot(x=top_cwe['mean'], y=top_cwe.index, hue=top_cwe.index, palette="flare", legend=False)
-    ax.spines['bottom'].set_color('#333333')
-    ax.spines['left'].set_color('#333333')
-    ax.tick_params(axis='both', colors='#333333', labelsize=10)
+    # FIGURE 1: Consolidated Violin Plot (Cross-Tier Distribution)
+    plt.figure(figsize=(11, 6))
+    palette_colors = {tier: cfg["color"] for tier, cfg in MODEL_TIERS.items()}
     
-    plt.xlim(0, 0.6)
-    plt.text(0.88, 0.08, f'Global Mean\nVariance:\n{global_mean:.4f}', transform=ax.transAxes, 
-             fontsize=10, fontweight='bold', verticalalignment='bottom', horizontalalignment='center', 
-             bbox=dict(facecolor='white', alpha=1.0, edgecolor='black', boxstyle='square,pad=0.8', linewidth=1))
-
-    plt.title("CWE Sensitivity Ranking (Mean Variance)", fontsize=12, fontweight='bold')
-    plt.xlabel("Semantic Instability (1 - Cosine Similarity)", fontsize=11, fontweight='bold')
-    plt.ylabel("CWE Identifier", fontsize=11, fontweight='bold')
-    plt.savefig(os.path.join(OUTPUT_DIR, "2_cwe_fragility.png"), dpi=600, bbox_inches='tight')
+    sns.violinplot(
+        x='perturbation_type', 
+        y='semantic_variance', 
+        hue='model_tier',
+        data=compiled_data, 
+        palette=palette_colors,
+        split=False,
+        inner="quartile"
+    )
+    plt.title("Semantic Instability Profiles Across Parameter Scales", fontsize=13, fontweight='bold')
+    plt.xlabel("Applied Code Transformation Model", fontsize=11, fontweight='bold')
+    plt.ylabel("Semantic Instability (1 - Cosine Similarity)", fontsize=11, fontweight='bold')
+    plt.legend(title="Evaluated Tier Model")
+    plt.savefig(os.path.join(OUTPUT_DIR, "rq1_cross_tier_violin.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 3. Regression Plot: Complexity vs Instability
-    plt.figure(figsize=(10, 6))
-    sns.regplot(x='code_len_increase', y='semantic_variance', data=df, scatter_kws={'alpha':0.4, 'color':'teal'}, line_kws={'color':'red'})
-    plt.title("Impact of Structural Complexity on Instability", fontsize=14, fontweight='bold')
-    plt.xlabel("Code Volume Delta (Characters)", fontsize=12, fontweight='bold')
-    plt.ylabel("Semantic Variance", fontsize=12, fontweight='bold')
-    plt.savefig(os.path.join(OUTPUT_DIR, "3_complexity_impact_ieee.png"), dpi=300, bbox_inches='tight')
+    # FIGURE 2: Multi-Facet Regression Lines
+    g = sns.FacetGrid(compiled_data, col="model_tier", hue="model_tier", palette=palette_colors, height=5, aspect=1)
+    g.map(sns.regplot, "code_len_increase", "semantic_variance", scatter_kws={'alpha':0.3}, line_kws={'color':'red'})
+    g.set_axis_labels("Code Volume Delta (Chars)", "Semantic Variance")
+    g.set_titles(col_template="{col_name}")
+    plt.savefig(os.path.join(OUTPUT_DIR, "rq1_complexity_vs_scale_regression.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 4. Heatmap: Categorical Drift
-    plt.figure(figsize=(12, 8))
-    pivot_table = df.pivot_table(values='jaccard_instability', index='cwe', columns='perturbation_type', aggfunc='mean')
-    pivot_table = pivot_table.loc[top_cwe.index]
-    sns.heatmap(pivot_table, annot=True, cmap="YlGnBu", cbar_kws={'label': 'Keyword Shift Score'})
-    plt.title("Categorical Drift Matrix (Jaccard Instability)", fontweight='bold')
-    plt.savefig(os.path.join(OUTPUT_DIR, "4_drift_heatmap.png"), dpi=300, bbox_inches='tight')
+    # FIGURE 3: Comparative Heatmap Matrix
+    plt.figure(figsize=(14, 8))
+    pivot_matrix = compiled_data.pivot_table(
+        values='semantic_variance', 
+        index='cwe', 
+        columns='model_tier', 
+        aggfunc='mean'
+    ).fillna(0)
+    
+    # Filter matrix to only look at high-volume categories
+    top_cwes = compiled_data['cwe'].value_counts().head(10).index
+    pivot_matrix = pivot_matrix.loc[top_cwes]
+    
+    sns.heatmap(pivot_matrix, annot=True, cmap="mako", fmt=".4f", cbar_kws={'label': 'Mean Instability Metric'})
+    plt.title("CWE Vulnerability Fragility Mapping Matrix Across Model Tiers", fontsize=13, fontweight='bold')
+    plt.xlabel("Evaluated Parameter Scale", fontsize=11, fontweight='bold')
+    plt.ylabel("CWE Categorization", fontsize=11, fontweight='bold')
+    plt.savefig(os.path.join(OUTPUT_DIR, "rq1_cwe_tier_instability_heatmap.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
-    # 5. Export and Logging
-    df.to_csv(os.path.join(OUTPUT_DIR, "rq1_refined_results.csv"), index=False)
+
+def main():
+    print("=" * 70)
+    print("LAUNCHING MULTI-TIER COGNITIVE INSTABILITY SUITE (RQ1)")
+    print("=" * 70)
     
-    print("\n" + "="*50)
-    print("RQ1 FINAL STATISTICAL REPORT")
-    print("="*50)
-    print(f"Total Samples Analyzed: {len(df)}")
-    print(f"Global Mean Semantic Variance: {df['semantic_variance'].mean():.4f}")
-    print(f"Wilcoxon Significance (Drift): p = {p_wilcoxon:.4e}, r = {r_wilcoxon:.4f}")
-    print(f"Kruskal-Wallis (Between Groups): p = {p_kruskal:.4f}")
+    # Accelerate embedding operations via host hardware if active
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Assigning SentenceTransformer vector evaluation logic onto: [{device}]")
     
-    if p_kruskal < 0.05:
-        print(">> Result: Transformation type has a SIGNIFICANT impact.")
-        if HAS_POSTHOC and posthoc_df is not None:
-            print("\nPost-hoc Dunn's Test (Significance Matrix):")
-            print(posthoc_df)
-    else:
-        print(">> Result: No statistically significant difference between transformation types.")
+    st_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
     
-    print("-" * 50)
-    print("MOST SEMANTICALLY FRAGILE CWEs:")
-    print(cwe_summary[['mean', 'count']].head(5))
-    print("="*50)
+    master_frames = []
+    summary_stats = []
+
+    for tier_name, config in MODEL_TIERS.items():
+        print(f">> Executing data pull on target file for: {tier_name}")
+        try:
+            tier_df = process_single_tier(config["path"], st_model, device)
+            tier_df["model_tier"] = tier_name
+            master_frames.append(tier_df)
+            
+            # Extract high-fidelity numbers
+            n = len(tier_df)
+            mean_v = tier_df['semantic_variance'].mean()
+            std_v = tier_df['semantic_variance'].std()
+            
+            # Wilcoxon Significance Checks
+            _, p_wilc = stats.wilcoxon(tier_df['semantic_variance'])
+            
+            summary_stats.append({
+                "Model Tier": tier_name,
+                "Sample Count": n,
+                "Mean Instability": round(mean_v, 4),
+                "StdDev": round(std_v, 4),
+                "Wilcoxon p-val": f"{p_wilc:.4e}"
+            })
+            
+        except FileNotFoundError as err:
+            print(f"[SKIPPED] {tier_name} source data table not discovered. Path target: {config['path']}")
+
+    if not master_frames:
+        print("[CRITICAL ERROR] No viable data targets parsed. Execution aborted.")
+        return
+
+    # Unify dataframe blocks
+    compiled_df = pd.concat(master_frames, ignore_index=True)
+    
+    # Generate multi-tiered graphics suite
+    print(">> Rendering consolidated comparative plot sheets...")
+    generate_unified_reports(compiled_df, summary_stats)
+    
+    # Save processed dataframe array back to disk
+    compiled_df.to_csv(os.path.join(OUTPUT_DIR, "rq1_multitier_master_results.csv"), index=False)
+
+    # Render clean structural markdown table output inside the terminal screen console
+    stats_df = pd.DataFrame(summary_stats)
+    
+    print("\n" + "=" * 70)
+    print("EMPIRICAL COMPARATIVE TABLE: MODEL ACCURACY VS SEMANTIC BRITTLENESS")
+    print("=" * 70)
+    print(stats_df.to_string(index=False))
+    print("=" * 70)
+    
+    # Cross-Tier Omni-Kruskal Check (Does scale statistically matter?)
+    groups = [g['semantic_variance'].values for _, g in compiled_df.groupby('model_tier')]
+    if len(groups) > 1:
+        h_val, p_val = stats.kruskal(*groups)
+        print(f"\n[OMNIBUS METRIC] Cross-Tier Kruskal-Wallis Evaluation:")
+        print(f"H-Statistic: {h_val:.4f}, Asymptotic Probability value (p-value): {p_val:.8e}")
+        if p_val < 0.05:
+            print(">> SUCCESSFUL EMPIRICAL PROOF: Scaling parameter count introduces a STATISTICALLY SIGNIFICANT shift in reasoning stability.")
+        else:
+            print(">> EXPERIMENTAL DISCOVERY: Parameter scaling did not show significant resistance against semantic layout modifications.")
+    print("=" * 70 + "\n")
+
 
 if __name__ == "__main__":
-    analyze_rq1()
+    main()
