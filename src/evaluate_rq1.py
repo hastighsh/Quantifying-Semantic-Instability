@@ -155,8 +155,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Assigning SentenceTransformer vector evaluation logic onto: [{device}]")
     
-    st_model = SentenceTransformer('all-MiniLM-L6-v2', device=device)
-    
+    st_model = SentenceTransformer(
+        '/scratch/hghanesh/models/all-MiniLM-L6-v2',
+        local_files_only=True
+    )    
     master_frames = []
     summary_stats = []
 
