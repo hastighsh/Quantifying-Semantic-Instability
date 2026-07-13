@@ -23,17 +23,17 @@ repository-root/
 │   ├── add_baseline.py
 │   ├── verify_parallel.py
 │   ├── filter_baseline.py
-│   └── rq1_syntax/
-│       ├── perturb_code.py
-│       ├── syntactic_inference.py
-│       └── evaluate_rq1.py
-├── rq2_prompts/
-│   ├── prompt_inference.py
-│   └── evaluate_rq2.py
-├── rq3_context/
-│   ├── deceptive_data_injection.py
-│   ├── context_inference.py
-│   └── evaluate_rq3.py
+│   ├── rq1_syntax/
+│   │   ├── perturb_code.py
+│   │   ├── syntactic_inference.py
+│   │   └── evaluate_rq1.py
+│   ├── rq2_prompts/
+│   │   ├── prompt_inference.py
+│   │   └── evaluate_rq2.py
+│   └── rq3_context/
+│       ├── deceptive_data_injection.py
+│       ├── context_inference.py
+│       └── evaluate_rq3.py
 ├── requirements.txt
 └── README.md
 ```
@@ -120,7 +120,7 @@ filtered_experimental_set.csv
                 rq2_formal_results_qwen*.csv
 ```
 
-RQ1 and RQ2 only require the verified baseline dataset. RQ3 evaluation also uses the formal RQ2 outputs as its non-deceptive baseline.
+RQ1 and RQ2 require the verified baseline dataset. RQ3 evaluation also uses the formal RQ2 outputs as its non-deceptive baseline.
 
 # 1. Baseline Construction
 
@@ -168,10 +168,14 @@ import pandas as pd
 shard_dir = Path("data/baseline_shards")
 output_path = Path("data/baseline_results_complete.csv")
 
-files = sorted(shard_dir.glob("baseline_results_shard_*_of_8.csv"))
+files = sorted(
+    shard_dir.glob("baseline_results_shard_*_of_8.csv")
+)
 
 if len(files) != 8:
-    raise RuntimeError(f"Expected 8 shard files, found {len(files)}.")
+    raise RuntimeError(
+        f"Expected 8 shard files, found {len(files)}."
+    )
 
 df = pd.concat(
     [pd.read_csv(path, dtype=str) for path in files],
@@ -184,9 +188,14 @@ df["original_index"] = pd.to_numeric(
 ).astype(int)
 
 if df["original_index"].duplicated().any():
-    raise RuntimeError("Duplicate original_index values found.")
+    raise RuntimeError(
+        "Duplicate original_index values found."
+    )
 
-df = df.sort_values("original_index").reset_index(drop=True)
+df = df.sort_values(
+    "original_index"
+).reset_index(drop=True)
+
 df.to_csv(output_path, index=False)
 
 print(f"Saved {len(df)} rows to {output_path}")
@@ -293,7 +302,7 @@ Run all model-persona combinations:
 ```bash
 for size in 7B 14B 32B; do
     for persona in naive formal expert; do
-        python rq2_prompts/prompt_inference.py \
+        python src/rq2_prompts/prompt_inference.py \
             --size "$size" \
             --persona "$persona"
     done
@@ -317,7 +326,7 @@ results/rq2_expert_results_qwen32b.csv
 ## Evaluate RQ2
 
 ```bash
-python rq2_prompts/evaluate_rq2.py --strict
+python src/rq2_prompts/evaluate_rq2.py --strict
 ```
 
 Results are written to:
@@ -329,7 +338,7 @@ results/analysis_rq2_ieee/
 Optional configuration:
 
 ```bash
-python rq2_prompts/evaluate_rq2.py \
+python src/rq2_prompts/evaluate_rq2.py \
     --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
     --device auto \
     --sizes 7B 14B 32B \
@@ -362,7 +371,7 @@ SUFFIX
 ## Generate the Deceptive Dataset
 
 ```bash
-python rq3_context/deceptive_data_injection.py
+python src/rq3_context/deceptive_data_injection.py
 ```
 
 Output:
@@ -374,15 +383,15 @@ data/deceptive_experimental_set.csv
 Overwrite an existing file with:
 
 ```bash
-python rq3_context/deceptive_data_injection.py --overwrite
+python src/rq3_context/deceptive_data_injection.py --overwrite
 ```
 
 ## Run RQ3 Inference
 
 ```bash
-python rq3_context/context_inference.py --size 7B
-python rq3_context/context_inference.py --size 14B
-python rq3_context/context_inference.py --size 32B
+python src/rq3_context/context_inference.py --size 7B
+python src/rq3_context/context_inference.py --size 14B
+python src/rq3_context/context_inference.py --size 32B
 ```
 
 Outputs:
@@ -412,15 +421,23 @@ results/rq2_formal_results_qwen32b.csv
 Create them with:
 
 ```bash
-python rq2_prompts/prompt_inference.py --size 7B --persona formal
-python rq2_prompts/prompt_inference.py --size 14B --persona formal
-python rq2_prompts/prompt_inference.py --size 32B --persona formal
+python src/rq2_prompts/prompt_inference.py \
+    --size 7B \
+    --persona formal
+
+python src/rq2_prompts/prompt_inference.py \
+    --size 14B \
+    --persona formal
+
+python src/rq2_prompts/prompt_inference.py \
+    --size 32B \
+    --persona formal
 ```
 
 ## Evaluate RQ3
 
 ```bash
-python rq3_context/evaluate_rq3.py --strict
+python src/rq3_context/evaluate_rq3.py --strict
 ```
 
 Results are written to:
@@ -432,7 +449,7 @@ results/analysis_rq3_ieee/
 Optional configuration:
 
 ```bash
-python rq3_context/evaluate_rq3.py \
+python src/rq3_context/evaluate_rq3.py \
     --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
     --device auto \
     --sizes 7B 14B 32B \
@@ -452,6 +469,7 @@ for shard_id in {0..7}; do
 done
 
 # Merge the baseline shards before continuing.
+
 python src/verify_parallel.py
 python src/filter_baseline.py
 
@@ -465,20 +483,20 @@ python src/rq1_syntax/evaluate_rq1.py
 # RQ2
 for size in 7B 14B 32B; do
     for persona in naive formal expert; do
-        python rq2_prompts/prompt_inference.py \
+        python src/rq2_prompts/prompt_inference.py \
             --size "$size" \
             --persona "$persona"
     done
 done
 
-python rq2_prompts/evaluate_rq2.py --strict
+python src/rq2_prompts/evaluate_rq2.py --strict
 
 # RQ3
-python rq3_context/deceptive_data_injection.py
-python rq3_context/context_inference.py --size 7B
-python rq3_context/context_inference.py --size 14B
-python rq3_context/context_inference.py --size 32B
-python rq3_context/evaluate_rq3.py --strict
+python src/rq3_context/deceptive_data_injection.py
+python src/rq3_context/context_inference.py --size 7B
+python src/rq3_context/context_inference.py --size 14B
+python src/rq3_context/context_inference.py --size 32B
+python src/rq3_context/evaluate_rq3.py --strict
 ```
 
 ## Reproducibility Notes
