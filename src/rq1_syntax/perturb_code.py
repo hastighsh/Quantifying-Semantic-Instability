@@ -4,8 +4,9 @@ from tree_sitter import Language, Parser
 import tree_sitter_c
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-
+PROJECT_ROOT = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "..", "..")
+)
 INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "filtered_experimental_set.csv")
 OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "perturbed_set.csv")
 

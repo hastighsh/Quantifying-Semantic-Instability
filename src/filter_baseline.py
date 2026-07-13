@@ -6,7 +6,7 @@ import pandas as pd
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "verified_baseline_complete_4gpu.csv")
+INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "verified_baseline.csv")
 OUTPUT_PATH = os.path.join(PROJECT_ROOT, "data", "filtered_experimental_set.csv")
 
 
@@ -18,7 +18,7 @@ def parse_boolean_column(series):
     return series.astype(str).str.strip().str.upper().isin(["TRUE", "1", "YES"])
 
 
-def analyze_results(df, source_name="verified_baseline_complete_4gpu.csv"):
+def analyze_results(df, source_name="verified_baseline.csv"):
     # Ensure standard boolean alignment
     df['is_correct'] = parse_boolean_column(df['is_correct'])
 

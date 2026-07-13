@@ -12,7 +12,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
 
-INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "data", "gold_set_raw.csv")
+INPUT_PATH = os.path.join(PROJECT_ROOT, "data", "gold_set_raw.csv")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "data", "baseline_shards")
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
