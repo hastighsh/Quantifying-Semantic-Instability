@@ -187,7 +187,7 @@ def resolve_project_root(args):
         return os.path.abspath(args.project_root)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.abspath(os.path.join(script_dir, ".."))
+    project_root = os.path.abspath(os.path.join(script_dir, "..", ".."))
 
 
 def choose_device(device_arg):

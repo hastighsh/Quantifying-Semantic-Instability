@@ -1418,10 +1418,16 @@ def main():
     args = parse_args()
 
     project_root = (
-        os.path.abspath(args.project_root)
-        if args.project_root
-        else os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    os.path.abspath(args.project_root)
+    if args.project_root
+    else os.path.abspath(
+        os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+        )
     )
+)
 
     results_dir = (
         os.path.abspath(args.results_dir)
